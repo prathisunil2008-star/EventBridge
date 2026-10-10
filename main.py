@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="EventBridge")
 
-DATABASE_PATH = Path(__file__).with_name("events.db")
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(Path(__file__).with_name("events.db"))))
 async def send_to_downstream(payload: dict) -> None:
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
