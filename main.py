@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import asyncio
 import httpx
 import hashlib
 import json
@@ -8,11 +9,29 @@ import sqlite3
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 app = FastAPI(title="EventBridge")
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(Path(__file__).with_name("events.db"))))
+
+event_subscribers: set[asyncio.Queue[None]] = set()
+
+
+def notify_events_changed() -> None:
+    """Notify connected dashboards that persisted event data changed."""
+    for queue in tuple(event_subscribers):
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+
 async def send_to_downstream(payload: dict) -> None:
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
@@ -93,8 +112,8 @@ async def receive_webhook(
     )
     key_value = delivery_id or hashlib.sha256(raw_body).hexdigest()
     idempotency_key = f"{source}:{key_value}"
-    with sqlite3.connect(DATABASE_PATH) as connection:
-                connection.execute(
+    with sqlite3.connect(DATABASE_PATH, timeout=10) as connection:
+        connection.execute(
             """
             INSERT INTO webhook_events (
                 source, received_at, payload_json, idempotency_key
@@ -111,49 +130,51 @@ async def receive_webhook(
                 idempotency_key,
             ),
         )
-                row = connection.execute(
-           "SELECT id, status FROM webhook_events WHERE idempotency_key = ?",
+        row = connection.execute(
+            "SELECT id, status FROM webhook_events WHERE idempotency_key = ?",
             (idempotency_key,),
-                ).fetchone()
-                event_id = row[0]
-                event_status = row[1]
-                if event_status != "completed":
-                   if isinstance(payload, dict):
-                      try:
-                          await send_to_downstream(payload)
-                      except httpx.HTTPError as error:
-                          connection.execute(
-                        """
-                        UPDATE webhook_events
-                        SET status = 'failed',
-                            attempt_count = attempt_count + 1,
-                            failure_reason = ?
-                        WHERE id = ?
-                        """,
-                        (str(error), event_id),
-                           )
-                      else:
-                          connection.execute(
-                        """
-                        UPDATE webhook_events
-                        SET status = 'completed',
-                            attempt_count = attempt_count + 1,
-                            failure_reason = NULL
-                        WHERE id = ?
-                        """,
-                        (event_id,),
-                          )
-                else:
-                    connection.execute(
-                    """
-                    UPDATE webhook_events
-                    SET status = 'failed',
-                        attempt_count = attempt_count + 1,
-                        failure_reason = ?
-                    WHERE id = ?
-                    """,
-                    ("Webhook payload must be a JSON object", event_id),
-                   )
+        ).fetchone()
+        event_id, event_status = row
+        should_process = False
+        if event_status in ("received", "failed"):
+            cursor = connection.execute(
+                """
+                UPDATE webhook_events
+                SET status = 'processing',
+                    attempt_count = attempt_count + 1,
+                    failure_reason = NULL
+                WHERE id = ? AND status IN ('received', 'failed')
+                """,
+                (event_id,),
+            )
+            should_process = cursor.rowcount == 1
+
+    # Commit before notifying clients or awaiting the downstream HTTP request.
+    notify_events_changed()
+    if should_process:
+        if not isinstance(payload, dict):
+            status = "failed"
+            failure_reason = "Webhook payload must be a JSON object"
+        else:
+            try:
+                await send_to_downstream(payload)
+            except httpx.HTTPError as error:
+                status = "failed"
+                failure_reason = str(error)
+            else:
+                status = "completed"
+                failure_reason = None
+
+        with sqlite3.connect(DATABASE_PATH, timeout=10) as connection:
+            connection.execute(
+                """
+                UPDATE webhook_events
+                SET status = ?, failure_reason = ?
+                WHERE id = ?
+                """,
+                (status, failure_reason, event_id),
+            )
+        notify_events_changed()
     return {"accepted": True, "event_id": event_id}
 
 @app.get("/events")
@@ -177,6 +198,32 @@ def list_events():
         }
         for row in rows
     ]
+
+
+@app.get("/events/stream")
+async def stream_event_updates():
+    queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+    event_subscribers.add(queue)
+
+    async def event_stream():
+        try:
+            # Send an initial event so each newly connected dashboard loads now.
+            yield "event: events\ndata: update\n\n"
+            while True:
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                else:
+                    yield "event: events\ndata: update\n\n"
+        finally:
+            event_subscribers.discard(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.get("/events/{event_id}/details")
 def get_event_details(
@@ -251,6 +298,8 @@ async def retry_event(
         if cursor.rowcount != 1:
             raise HTTPException(status_code=409, detail="Event is already being retried")
 
+    notify_events_changed()
+
     try:
         if not isinstance(payload, dict):
             raise ValueError("Webhook payload must be a JSON object")
@@ -271,6 +320,8 @@ async def retry_event(
             (status, failure_reason, event_id),
         )
 
+    notify_events_changed()
+
     return {"event_id": event_id, "status": status}
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -290,7 +341,7 @@ def dashboard():
     </head>
     <body>
         <h1>EventBridge</h1>
-        <p>Webhook events — refreshes every 5 seconds.</p>
+        <p>Webhook events — live updates.</p>
         <p id="updated">Loading events…</p>
         <table>
             <thead>
@@ -386,7 +437,11 @@ async function refreshEvents() {
 }
 
 refreshEvents();
-setInterval(refreshEvents, 5000);
+const eventStream = new EventSource("/events/stream");
+eventStream.addEventListener("events", refreshEvents);
+eventStream.onerror = () => {
+    document.getElementById("updated").textContent = "Reconnecting to live updates…";
+};
         </script>
     </body>
     </html>
