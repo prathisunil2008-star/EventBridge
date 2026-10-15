@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 app = FastAPI(title="EventBridge")
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(Path(__file__).with_name("events.db"))))
+DOWNSTREAM_URL = os.getenv("DOWNSTREAM_URL", "https://httpbin.org/post")
 
 event_subscribers: set[asyncio.Queue[None]] = set()
 
@@ -35,7 +36,7 @@ def notify_events_changed() -> None:
 async def send_to_downstream(payload: dict) -> None:
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(
-            "https://httpbin.org/post",
+            DOWNSTREAM_URL,
             json=payload,
         )
         response.raise_for_status()

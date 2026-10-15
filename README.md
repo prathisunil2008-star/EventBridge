@@ -35,7 +35,7 @@ The response includes `accepted` and the event ID. Open the dashboard to see the
 
 ## Downstream processing
 
-For this project, EventBridge forwards each JSON object to `https://httpbin.org/post`, a test HTTP endpoint. Use sample data only; this is not connected to a production business service.
+For this project, EventBridge forwards each JSON object to `https://httpbin.org/post`, a test HTTP endpoint. The destination can be changed with the optional `DOWNSTREAM_URL` environment variable. Use sample data only; this is not connected to a production business service.
 
 ## Railway configuration
 
@@ -44,6 +44,7 @@ Set these variables in the Railway service's **Variables** tab. Keep their value
 - `WEBHOOK_SECRET` — required to accept webhook requests.
 - `DASHBOARD_PASSWORD` — required to view event payloads and trigger retries.
 - `DATABASE_PATH` — set to `/data/events.db` for the Railway volume.
+- `DOWNSTREAM_URL` — optional downstream HTTP endpoint; defaults to `https://httpbin.org/post`.
 
 The service starts with `uvicorn main:app --host 0.0.0.0 --port $PORT`.
 
